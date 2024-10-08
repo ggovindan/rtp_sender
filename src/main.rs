@@ -3,9 +3,6 @@ use gst_rtp::RTPBuffer;
 use anyhow::Error;
 use gst::ClockTime;
 
-// Working version
-// GST_DEBUG=2 gst-launch-1.0 rtspsrc location=rtsp://admin:spot2330@10.0.0.7:554/ name=rtspsrc latency=10 \
-// rtspsrc. ! rtph265depay ! tee name=t t. ! queue ! rtph265pay config-interval=-1 ! udpsink name=udpsink host=127.0.0.1 port=56001
 
 // Inside main
 fn main() {
@@ -13,9 +10,9 @@ fn main() {
 
     let pipeline_str = "rtspsrc location=rtsp://admin:spot2330@10.0.0.249:554/ name=rtspsrc latency=100 \
      rtspsrc. ! rtph265depay ! tee name=t \
-        t. ! queue ! h265parse ! rtph265pay name=rtph265pay config-interval=-1 ! udpsink name=udpsink host=127.0.0.1 port=56001";
+        t. ! queue ! h265parse name=h265parse ! rtph265pay name=rtph265pay config-interval=1 ! udpsink name=udpsink host=127.0.0.1 port=56001";
 
-    // let pipeline_str = "rtspsrc location=rtsp://admin:spot2330@10.0.0.249:554/ name=rtspsrc latency=100 \
+    // let pipeline_str = "rtspsrc location=rtsp://admin:mypassword@10.0.0.249:554/ name=rtspsrc latency=100 \
     //  rtspsrc. ! rtph264depay ! tee name=t \
     //     t. ! queue ! h264parse ! rtph264pay name=rtph265pay config-interval=-1 ! udpsink name=udpsink host=127.0.0.1 port=56001";
 
@@ -27,10 +24,29 @@ fn main() {
     let rtph265pay = pipeline.by_name("rtph265pay").unwrap();
 
     let rtppay_src_pad = rtph265pay.static_pad("src").unwrap();
+    let rtppay_sink_pad = rtph265pay.static_pad("sink").unwrap();
+
+
+    let udpsink = pipeline.by_name("udpsink").unwrap();
+
+    let udpsink_sink_pad = udpsink.static_pad("sink").unwrap();
 
     let rtspsrc = pipeline.by_name("rtspsrc").unwrap();
 
     let bin_ref = pipeline.clone();
+
+    let h265parse = pipeline.by_name("h265parse").unwrap();
+    let h265parse_src_pad = h265parse.static_pad("src").unwrap();
+    h265parse_src_pad.add_probe(gst::PadProbeType::BUFFER, |_, _| {
+        println!("Buffer flowing through h265parse");
+        gst::PadProbeReturn::Ok
+    });
+
+    rtppay_sink_pad.add_probe(gst::PadProbeType::BUFFER, |_, _| {
+        println!("Buffer flowing through rtppay_sink");
+        gst::PadProbeReturn::Ok
+    });
+
 
     rtspsrc.connect_pad_added(move |_, src_pad| {
         match src_pad.current_caps() {
@@ -45,7 +61,7 @@ fn main() {
                             if field_value == "video" {
                                 bin_ref.debug_to_dot_file(gst::DebugGraphDetails::all(), "PLAYING");
                                 rtppay_src_pad.add_probe(gst::PadProbeType::BUFFER, |pad, probe_info| {
-                                    println!("adding probe for rtppay");
+                                    println!("adding probe for rtspsrc");
                                     if let Some(probe_data) = probe_info.data.as_mut() {
                                         if let gst::PadProbeData::Buffer(ref mut buffer) = probe_data {
                                             let size = buffer.size();
@@ -72,11 +88,49 @@ fn main() {
 
                                             if let Err(e) = result {
                                                 eprintln!("Failed to add RTP header extension: {:?}", e);
+                                            } else {
+
                                             }
                                         }
                                     }
                                     gst::PadProbeReturn::Ok
                                 });
+
+                                udpsink_sink_pad.add_probe(gst::PadProbeType::BUFFER, |pad, probe_info| {
+                                    println!("GURU: adding pad probe to udpsink");
+                                    if let Some(probe_data) = probe_info.data.as_ref() {
+                                        if let gst::PadProbeData::Buffer(buffer) = probe_data {
+                                            let rtp_buffer = RTPBuffer::from_buffer_readable(buffer).unwrap();
+                                            // Check for RTP extension header
+                                            if let Some((appbits, extension_data)) = rtp_buffer.extension_twobytes_header(1, 0) { //extension_twobytes_header(1, 0) {
+                                                println!("RTP Extension present:");
+                                                println!("App bits: {}", appbits);
+                                                println!("Extension data: {:?}", extension_data);
+
+                                                // Convert the extension data back to PTS
+                                                if extension_data.len() != 0 {
+                                                    let mut pts_bytes = [0u8; 8];
+                                                    pts_bytes[..4].copy_from_slice(&extension_data[..4]);  // Copy the first 4 bytes
+                                                    let pts = u64::from_be_bytes(pts_bytes);
+                                                    //let pts = u64::from_be_bytes(extension_data.try_into().unwrap());
+                                                    println!("Extracted PTS from RTP extension: {}", pts);
+                                                }
+                                            } else {
+                                                println!("No RTP Extension found");
+                                            }
+                                            match rtp_buffer.buffer().pts() {
+                                                Some(pts) => {
+                                                    println!("udpsink buffer.pts={}", pts.seconds());
+                                                },
+                                                None => {
+                                                    println!("No PTS, cannot get bandwidth");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    gst::PadProbeReturn::Ok
+                                }).unwrap();
+
                             }
                         }
                         _ => {}
@@ -89,43 +143,6 @@ fn main() {
 
 
     let pipeline = pipe_elem.clone().downcast::<gst::Pipeline>().unwrap();
-    let udpsink = pipeline.by_name("udpsink").unwrap();
-
-    let udpsink_sink_pad = udpsink.static_pad("sink").unwrap();
-    udpsink_sink_pad.add_probe(gst::PadProbeType::BUFFER, |pad, probe_info| {
-        println!("GURU: adding pad probe to udpsink");
-        if let Some(probe_data) = probe_info.data.as_ref() {
-            if let gst::PadProbeData::Buffer(buffer) = probe_data {
-                let rtp_buffer = RTPBuffer::from_buffer_readable(buffer).unwrap();
-                // Check for RTP extension header
-                if let Some((appbits, extension_data)) = rtp_buffer.extension_twobytes_header(1, 0) { //extension_twobytes_header(1, 0) {
-                    println!("RTP Extension present:");
-                    println!("App bits: {}", appbits);
-                    println!("Extension data: {:?}", extension_data);
-
-                    // Convert the extension data back to PTS
-                    if extension_data.len() != 0 {
-                        let mut pts_bytes = [0u8; 8];
-                        pts_bytes[..4].copy_from_slice(&extension_data[..4]);  // Copy the first 4 bytes
-                        let pts = u64::from_be_bytes(pts_bytes);
-                        //let pts = u64::from_be_bytes(extension_data.try_into().unwrap());
-                        println!("Extracted PTS from RTP extension: {}", pts);
-                    }
-                } else {
-                    println!("No RTP Extension found");
-                }
-                match rtp_buffer.buffer().pts() {
-                    Some(pts) => {
-                        println!("udpsink buffer.pts={}", pts.seconds());
-                    },
-                    None => {
-                        println!("No PTS, cannot get bandwidth");
-                    }
-                }
-            }
-        }
-        gst::PadProbeReturn::Ok
-    }).unwrap();
 
     // Start the pipeline and run the main loop
     let bus = pipeline.bus().unwrap();
